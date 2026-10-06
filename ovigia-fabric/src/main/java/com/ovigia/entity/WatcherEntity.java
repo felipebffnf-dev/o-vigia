@@ -1,7 +1,10 @@
 package com.ovigia.entity;
 
 import java.util.EnumSet;
+import java.util.HashSet;
+import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.LivingEntity;
@@ -57,6 +60,23 @@ public class WatcherEntity extends HostileEntity {
 			SoundEvents.ENTITY_ENDERMAN_STARE,
 			SoundEvents.ENTITY_GHAST_SCREAM
 	};
+
+	/** Sons quando ele te VÊ pela primeira vez (ou volta a te ver). */
+	private static final SoundEvent[] SIGHT_SOUNDS = {
+			SoundEvents.ENTITY_ENDERMAN_SCREAM,
+			SoundEvents.ENTITY_WARDEN_ANGRY,
+			SoundEvents.ENTITY_GHAST_SCREAM,
+			SoundEvents.ENTITY_ENDERMAN_STARE
+	};
+
+	// Resposta ao chat
+	private int replyTicks = 0;
+	private UUID replyPlayer = null;
+	private String replyText = "";
+
+	// Controle de "te vi"
+	private int sightCooldown = 0;
+	private int ticksSinceSight = 1000;
 
 	public WatcherEntity(EntityType<? extends HostileEntity> type, World world) {
 		super(type, world);
@@ -130,6 +150,25 @@ public class WatcherEntity extends HostileEntity {
 		super.tick();
 		if (this.getWorld().isClient) return;
 
+		// Te viu? Faz um som assustador (só pra você) e avisa na tela.
+		if (this.sightCooldown > 0) this.sightCooldown--;
+		LivingEntity tgt = this.getTarget();
+		boolean sees = tgt instanceof ServerPlayerEntity && this.canSee(tgt) && this.distanceTo(tgt) < 48.0f;
+		if (sees) {
+			if (this.ticksSinceSight > 60 && this.sightCooldown <= 0) {
+				onSpotted((ServerPlayerEntity) tgt);
+				this.sightCooldown = 300;
+			}
+			this.ticksSinceSight = 0;
+		} else if (this.ticksSinceSight < 10000) {
+			this.ticksSinceSight++;
+		}
+
+		// Responde ao chat depois de uma pequena pausa (como se estivesse "digitando").
+		if (this.replyTicks > 0 && --this.replyTicks == 0) {
+			sendReply();
+		}
+
 		// A cada segundo: aura de escuridão, sustos e mensagens falsas.
 		if (this.age % 20 == 0) {
 			for (PlayerEntity p : this.getWorld().getEntitiesByClass(PlayerEntity.class,
@@ -156,6 +195,82 @@ public class WatcherEntity extends HostileEntity {
 		if (this.age > 200 && this.getWorld().isDay()) {
 			this.discard();
 		}
+	}
+
+	// ---------- Te viu ----------
+
+	private void onSpotted(ServerPlayerEntity sp) {
+		SoundEvent s = SIGHT_SOUNDS[this.random.nextInt(SIGHT_SOUNDS.length)];
+		playSoundTo(sp, s, 1.8f, 0.5f + this.random.nextFloat() * 0.3f, this.getPos());
+		playSoundTo(sp, SoundEvents.ENTITY_WARDEN_HEARTBEAT, 1.2f, 0.7f, sp.getPos());
+		sp.sendMessage(Text.literal("Ele viu você.").formatted(Formatting.DARK_RED), true);
+	}
+
+	// ---------- Responder o chat ----------
+
+	/** Chamado quando um jogador por perto fala no chat. */
+	public void queueReply(ServerPlayerEntity sp, String text) {
+		if (this.replyTicks > 0) return;
+		if (this.random.nextInt(100) < 15) return; // às vezes só... ouve.
+		this.replyPlayer = sp.getUuid();
+		this.replyText = text == null ? "" : text;
+		this.replyTicks = 30 + this.random.nextInt(50);
+	}
+
+	private void sendReply() {
+		if (this.getServer() == null || this.replyPlayer == null) return;
+		ServerPlayerEntity sp = this.getServer().getPlayerManager().getPlayer(this.replyPlayer);
+		if (sp == null) return;
+		String reply = buildReply(sp.getEntityName(), this.replyText, this.distanceTo(sp));
+		int style = this.random.nextInt(10);
+		if (style < 7) {
+			chat(sp, "Vigia", reply);
+		} else if (style < 9) {
+			whisper(sp, reply);
+		} else {
+			chat(sp, sp.getEntityName(), reply); // responde com o SEU nome
+		}
+		playSoundTo(sp, SoundEvents.ENTITY_WARDEN_NEARBY_CLOSER, 0.7f, 0.7f, this.getPos());
+	}
+
+	private String pick(String... options) {
+		return options[this.random.nextInt(options.length)];
+	}
+
+	private static boolean has(String m, Set<String> words, String... keys) {
+		for (String k : keys) {
+			if (k.contains(" ") ? m.contains(k) : words.contains(k)) return true;
+		}
+		return false;
+	}
+
+	private String buildReply(String me, String raw, double dist) {
+		String m = raw.toLowerCase(Locale.ROOT);
+		Set<String> words = new HashSet<>();
+		for (String w : m.split("[^\\p{L}]+")) if (!w.isEmpty()) words.add(w);
+
+		if (has(m, words, "socorro", "help", "ajuda"))
+			return pick("ninguém vai te ajudar.", "ninguém está ouvindo. só eu.", "grite mais alto.");
+		if (has(m, words, "vai embora", "sai daqui", "me deixa", "pare", "para"))
+			return pick("eu não vou embora.", "foi você que entrou no meu mundo.", "eu nunca paro.");
+		if (has(m, words, "mate", "matar", "vou te", "bater"))
+			return pick("tente.", "eu já estou morto, " + me + ".", "você não me mata olhando pro chão.");
+		if (has(m, words, "quem", "o que é", "oq é", "que é você"))
+			return pick("eu sou o que olha quando você não olha.", "você já sabe quem eu sou.", "a última coisa que você vai ver.");
+		if (has(m, words, "onde", "cadê", "cade"))
+			return dist < 15 ? "perto. mais perto do que você pensa." : pick("atrás de você.", "onde você não está olhando.");
+		if (has(m, words, "medo", "assustado", "assusta"))
+			return pick("bom.", "eu sinto o seu medo daqui.", "continue com medo.");
+		if (has(m, words, "vigia", "watcher"))
+			return pick("você disse meu nome.", "diga de novo.");
+		if (has(m, words, "oi", "olá", "ola", "eae", "e aí", "e ai", "hello", "hi"))
+			return "oi, " + me + ". eu estava te esperando.";
+		if (m.contains("?"))
+			return pick("não faça perguntas cujas respostas você não quer.", "você já sabe a resposta.", "talvez.", "olhe para trás e descubra.");
+
+		String echo = raw.length() > 40 ? raw.substring(0, 40) + "..." : raw;
+		return pick("\"" + echo + "\"... eu ouvi.", "continue falando. eu gosto de ouvir.",
+				"ninguém vai responder além de mim.", me + "... " + me + "... " + me + "...");
 	}
 
 	// ---------- Mensagens falsas ----------
