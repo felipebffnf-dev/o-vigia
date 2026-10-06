@@ -45,6 +45,7 @@ public class OVigia implements ModInitializer {
 	@Override
 	public void onInitialize() {
 		FabricDefaultAttributeRegistry.register(WATCHER, WatcherEntity.createAttributes());
+		VigiaChat.register();
 
 		// Aparece no Overworld, é raro (peso baixo), sempre sozinho.
 		BiomeModifications.addSpawn(BiomeSelectors.foundInOverworld(), SpawnGroup.MONSTER, WATCHER, 6, 1, 1);
