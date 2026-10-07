@@ -6,6 +6,7 @@ import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import net.minecraft.block.BlockState;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.LivingEntity;
@@ -30,6 +31,8 @@ import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.network.packet.s2c.play.PlaySoundS2CPacket;
+import net.minecraft.network.packet.s2c.play.TitleFadeS2CPacket;
+import net.minecraft.network.packet.s2c.play.TitleS2CPacket;
 import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.sound.SoundCategory;
@@ -38,13 +41,18 @@ import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.GameRules;
+import net.minecraft.world.RaycastContext;
 import net.minecraft.world.World;
 
 /**
  * O Vigia:
- *  - copia a skin do jogador que ele escolhe como alvo;
+ *  - EMBOSCADA: tela preta (I see you), jogador travado olhando pra ele escondido, ele copia a skin;
+ *  - depois fica preto e CORRE atrás do jogador, quebrando blocos e machucando quem estiver no caminho;
  *  - fica PARADO enquanto alguém olha pra ele e avança quando você desvia o olhar;
  *  - persegue sem parar, e às vezes surge atrás de você (quando você não está olhando);
  *  - manda mensagens falsas no chat e toca sons atrás de você;
@@ -77,8 +85,17 @@ public class WatcherEntity extends HostileEntity {
 	private UUID replyPlayer = null;
 	private String replyText = "";
 
-	// Cópia dos movimentos do jogador
-	private boolean prevTargetOnGround = true;
+	/** Velocidade da perseguição (0.23 = zumbi; 0.28 = médio; 0.33 = bem rápido). Ajuste aqui. */
+	private static final double CHASE_SPEED = 0.28;
+
+	// Fases: 0 = rondando, 1 = emboscada (tela preta), 2 = perseguição
+	int phase = 0;
+	private int phaseTicks = 0;
+	private int ambushCooldown = 0;
+	private int noTargetTicks = 0;
+	private UUID ambushPlayer = null;
+
+	// Cópia dos gestos do jogador
 	private boolean prevTargetSwinging = false;
 
 	// Controle de "te vi"
@@ -92,7 +109,7 @@ public class WatcherEntity extends HostileEntity {
 	public static DefaultAttributeContainer.Builder createAttributes() {
 		return HostileEntity.createHostileAttributes()
 				.add(EntityAttributes.GENERIC_MAX_HEALTH, 60.0)
-				.add(EntityAttributes.GENERIC_MOVEMENT_SPEED, 0.36)
+				.add(EntityAttributes.GENERIC_MOVEMENT_SPEED, CHASE_SPEED)
 				.add(EntityAttributes.GENERIC_ATTACK_DAMAGE, 7.0)
 				.add(EntityAttributes.GENERIC_FOLLOW_RANGE, 64.0)
 				.add(EntityAttributes.GENERIC_KNOCKBACK_RESISTANCE, 0.6);
@@ -125,9 +142,10 @@ public class WatcherEntity extends HostileEntity {
 
 	@Override
 	protected void initGoals() {
+		this.goalSelector.add(0, new AmbushHoldGoal(this));
 		this.goalSelector.add(1, new SwimGoal(this));
 		this.goalSelector.add(2, new FreezeWhenWatchedGoal(this));
-		this.goalSelector.add(3, new MeleeAttackGoal(this, 1.3, true));
+		this.goalSelector.add(3, new MeleeAttackGoal(this, 1.0, true));
 		this.goalSelector.add(6, new WanderAroundFarGoal(this, 0.6));
 		this.goalSelector.add(7, new LookAtEntityGoal(this, PlayerEntity.class, 32.0f));
 		this.goalSelector.add(8, new LookAroundGoal(this));
@@ -137,42 +155,17 @@ public class WatcherEntity extends HostileEntity {
 	}
 
 	@Override
-	public void setTarget(LivingEntity target) {
-		LivingEntity old = this.getTarget();
-		super.setTarget(target);
-		if (target instanceof PlayerEntity player && old != target && !this.getWorld().isClient) {
-			// Ao escolher a vítima, assume a skin dela.
-			this.dataTracker.set(MIMIC, Optional.of(player.getUuid()));
-			// Até o nome igual ao do jogador.
-			this.setCustomName(Text.literal(player.getEntityName()));
-			this.setCustomNameVisible(true);
-			if (player instanceof ServerPlayerEntity sp) {
-				sp.sendMessage(Text.translatable("commands.message.display.incoming",
-						Text.literal("Vigia"), Text.literal("achei você, " + sp.getEntityName() + ".")
-				).formatted(Formatting.GRAY, Formatting.ITALIC), false);
-				playSoundTo(sp, SoundEvents.ENTITY_WARDEN_HEARTBEAT, 1.0f, 0.6f, sp.getPos());
-			}
-		}
-	}
-
-	@Override
 	public void tick() {
 		super.tick();
 		if (this.getWorld().isClient) return;
 
-		// Age como um jogador: copia agachar, correr, pular, bater e o equipamento do alvo.
-		LivingEntity mimicTarget = this.getTarget();
-		if (mimicTarget instanceof PlayerEntity tp) {
-			mimicPlayer(tp);
-		} else if (this.isSneaking() || this.isSprinting()) {
-			this.setSneaking(false);
-			this.setSprinting(false);
-		}
+		// Emboscada e perseguição.
+		tickPhases();
 
 		// Te viu? Faz um som assustador (só pra você) e avisa na tela.
 		if (this.sightCooldown > 0) this.sightCooldown--;
 		LivingEntity tgt = this.getTarget();
-		boolean sees = tgt instanceof ServerPlayerEntity && this.canSee(tgt) && this.distanceTo(tgt) < 48.0f;
+		boolean sees = this.phase != 1 && tgt instanceof ServerPlayerEntity && this.canSee(tgt) && this.distanceTo(tgt) < 48.0f;
 		if (sees) {
 			if (this.ticksSinceSight > 60 && this.sightCooldown <= 0) {
 				onSpotted((ServerPlayerEntity) tgt);
@@ -205,7 +198,7 @@ public class WatcherEntity extends HostileEntity {
 
 		// Às vezes aparece atrás de quem ele persegue (só se ninguém estiver olhando).
 		LivingEntity target = this.getTarget();
-		if (target != null && this.age % 80 == 0 && this.random.nextInt(3) == 0
+		if (this.phase == 0 && target != null && this.age % 80 == 0 && this.random.nextInt(3) == 0
 				&& this.distanceTo(target) > 20.0 && !this.isBeingWatched()) {
 			tryAppearBehind(target);
 		}
@@ -215,18 +208,8 @@ public class WatcherEntity extends HostileEntity {
 	// ---------- Copiar o jogador ----------
 
 	private void mimicPlayer(PlayerEntity tp) {
-		// Agacha quando o jogador agacha; corre quando ele corre (ou quando está longe).
+		// Agacha quando o jogador agacha e balança o braço quando ele bate.
 		this.setSneaking(tp.isSneaking());
-		boolean chasingFar = this.distanceTo(tp) > 6.0f && !tp.isSneaking();
-		this.setSprinting(tp.isSprinting() || chasingFar);
-
-		// Pula quando o jogador pula.
-		if (this.prevTargetOnGround && !tp.isOnGround() && this.isOnGround() && tp.fallDistance < 0.5f) {
-			this.jump();
-		}
-		this.prevTargetOnGround = tp.isOnGround();
-
-		// Balança o braço quando o jogador bate ou minera.
 		boolean swinging = tp.handSwinging;
 		if (swinging && !this.prevTargetSwinging) {
 			this.swingHand(Hand.MAIN_HAND);
@@ -249,6 +232,215 @@ public class WatcherEntity extends HostileEntity {
 				this.equipStack(slot, copy);
 			}
 			this.setEquipmentDropChance(slot, 0.0f); // não dropa o equipamento
+		}
+	}
+
+	// ---------- Emboscada e perseguição ----------
+
+	private ServerPlayerEntity ambushTarget() {
+		if (this.getServer() == null || this.ambushPlayer == null) return null;
+		return this.getServer().getPlayerManager().getPlayer(this.ambushPlayer);
+	}
+
+	private void tickPhases() {
+		if (this.ambushCooldown > 0) this.ambushCooldown--;
+		LivingEntity t = this.getTarget();
+		switch (this.phase) {
+			case 0 -> {
+				if (t instanceof ServerPlayerEntity sp && sp.isAlive() && this.ambushCooldown <= 0) {
+					startAmbush(sp);
+				}
+			}
+			case 1 -> tickAmbush();
+			default -> tickChase(t);
+		}
+	}
+
+	/** Fase 1: tela preta, jogador travado olhando pro Vigia escondido atrás de algo. */
+	private void startAmbush(ServerPlayerEntity sp) {
+		this.ambushCooldown = 6000; // 5 minutos até a próxima emboscada
+		BlockPos spot = findHidingSpot(sp);
+		if (spot == null) {
+			// Sem esconderijo por perto: vai direto para a perseguição.
+			this.phase = 2;
+			this.noTargetTicks = 0;
+			this.setTarget(sp);
+			return;
+		}
+		this.refreshPositionAndAngles(spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5, this.getYaw(), 0.0f);
+		this.getNavigation().stop();
+		this.phase = 1;
+		this.phaseTicks = 0;
+		this.ambushPlayer = sp.getUuid();
+		this.sightCooldown = 600;
+
+		// Copia a skin e o equipamento do jogador.
+		this.dataTracker.set(MIMIC, Optional.of(sp.getUuid()));
+		copyEquipment(sp);
+
+		// Tela preta + mensagem + jogador travado.
+		sp.addStatusEffect(new StatusEffectInstance(StatusEffects.BLINDNESS, 70, 0, false, false, false));
+		sp.addStatusEffect(new StatusEffectInstance(StatusEffects.SLOWNESS, 130, 9, false, false, false));
+		sp.addStatusEffect(new StatusEffectInstance(StatusEffects.JUMP_BOOST, 130, 128, false, false, false));
+		sp.networkHandler.sendPacket(new TitleFadeS2CPacket(5, 50, 15));
+		sp.networkHandler.sendPacket(new TitleS2CPacket(Text.literal("I see you").formatted(Formatting.DARK_RED)));
+		playSoundTo(sp, SoundEvents.ENTITY_WARDEN_HEARTBEAT, 1.5f, 0.6f, sp.getPos());
+		playSoundTo(sp, SoundEvents.ENTITY_ENDERMAN_STARE, 1.5f, 0.5f, this.getPos());
+	}
+
+	private void tickAmbush() {
+		ServerPlayerEntity sp = ambushTarget();
+		if (sp == null || !sp.isAlive()) {
+			clearDisguise();
+			this.phase = 0;
+			this.ambushCooldown = 200;
+			return;
+		}
+		this.phaseTicks++;
+		this.getNavigation().stop();
+		this.lookAtEntity(sp, 360.0f, 360.0f);
+		if (this.phaseTicks % 2 == 0) aimAt(sp); // a câmera do jogador fica "vidrada" nele
+		mimicPlayer(sp);
+
+		if (this.phaseTicks == 60) {
+			// A tela volta: ele dá um passo pra fora do esconderijo, com a sua skin e o seu nome.
+			stepOutOfCover(sp);
+			this.setCustomName(Text.literal(sp.getEntityName()));
+			this.setCustomNameVisible(true);
+			playSoundTo(sp, SoundEvents.ENTITY_WARDEN_HEARTBEAT, 1.5f, 0.5f, sp.getPos());
+		}
+		if (this.phaseTicks >= 115) {
+			beginChase(sp);
+		}
+	}
+
+	/** Fase 2: ele fica preto e corre atrás do jogador. */
+	private void beginChase(ServerPlayerEntity sp) {
+		clearDisguise();
+		sp.removeStatusEffect(StatusEffects.SLOWNESS);
+		sp.removeStatusEffect(StatusEffects.JUMP_BOOST);
+		sp.removeStatusEffect(StatusEffects.BLINDNESS);
+		playSoundTo(sp, SoundEvents.ENTITY_ENDERMAN_SCREAM, 2.0f, 0.5f, this.getPos());
+		sp.sendMessage(Text.literal("Corra.").formatted(Formatting.DARK_RED), true);
+		this.phase = 2;
+		this.noTargetTicks = 0;
+		this.setTarget(sp);
+	}
+
+	/** Volta à aparência preta: sem skin, sem nome e sem equipamento. */
+	private void clearDisguise() {
+		this.dataTracker.set(MIMIC, Optional.empty());
+		this.setCustomName(null);
+		this.setCustomNameVisible(false);
+		this.setSneaking(false);
+		for (EquipmentSlot slot : EquipmentSlot.values()) {
+			this.equipStack(slot, ItemStack.EMPTY);
+		}
+	}
+
+	private void tickChase(LivingEntity t) {
+		if (t == null || !t.isAlive()) {
+			// Perdeu ou matou o alvo: depois de um tempo, volta a rondar.
+			if (++this.noTargetTicks > 600) {
+				this.phase = 0;
+				this.setTarget(null);
+			}
+			return;
+		}
+		this.noTargetTicks = 0;
+
+		// Sem caminho livre? Vai em linha reta (e abre caminho quebrando blocos).
+		if (this.getNavigation().isIdle() && this.distanceTo(t) > 1.8f) {
+			this.getMoveControl().moveTo(t.getX(), t.getY(), t.getZ(), 1.0);
+		}
+		if (this.age % 4 == 0) breakBlocksAhead(t);
+		if (this.age % 10 == 0) smashEntitiesAhead();
+	}
+
+	/** Quebra os blocos que estão na frente dele, na direção do jogador. Respeita o gamerule mobGriefing. */
+	private void breakBlocksAhead(LivingEntity t) {
+		World w = this.getWorld();
+		if (!w.getGameRules().getBoolean(GameRules.DO_MOB_GRIEFING)) return;
+		Vec3d d = new Vec3d(t.getX() - this.getX(), 0, t.getZ() - this.getZ());
+		if (d.lengthSquared() < 0.01) return;
+		d = d.normalize();
+		for (int dy = 0; dy <= 1; dy++) {
+			for (double dist = 0.8; dist <= 1.4; dist += 0.6) {
+				BlockPos p = BlockPos.ofFloored(this.getX() + d.x * dist, this.getY() + dy, this.getZ() + d.z * dist);
+				BlockState st = w.getBlockState(p);
+				if (st.isAir() || !st.getFluidState().isEmpty()) continue;
+				if (st.getHardness(w, p) < 0) continue; // inquebrável (bedrock etc.)
+				w.breakBlock(p, false, this);
+			}
+		}
+	}
+
+	/** Machuca quem estiver no caminho dele (mobs, aldeões, outros jogadores). */
+	private void smashEntitiesAhead() {
+		for (LivingEntity e : this.getWorld().getEntitiesByClass(LivingEntity.class,
+				this.getBoundingBox().expand(0.8),
+				x -> x != this && !(x instanceof WatcherEntity) && x.isAlive()
+						&& !(x instanceof PlayerEntity pl && (pl.isCreative() || pl.isSpectator())))) {
+			e.damage(this.getDamageSources().mobAttack(this), 7.0f);
+		}
+	}
+
+	/** Gira a câmera do jogador para o Vigia (sem mexer na posição dele). */
+	private void aimAt(ServerPlayerEntity sp) {
+		Vec3d from = sp.getEyePos();
+		Vec3d to = this.getEyePos();
+		double dx = to.x - from.x;
+		double dy = to.y - from.y;
+		double dz = to.z - from.z;
+		double h = Math.sqrt(dx * dx + dz * dz);
+		float yaw = (float) (MathHelper.atan2(dz, dx) * 57.2957763671875) - 90.0f;
+		float pitch = (float) (-(MathHelper.atan2(dy, h) * 57.2957763671875));
+		sp.networkHandler.requestTeleport(sp.getX(), sp.getY(), sp.getZ(), yaw, pitch);
+	}
+
+	/** Procura um lugar escondido (atrás de árvore, parede, morro...) a 16-30 blocos do jogador. */
+	private BlockPos findHidingSpot(ServerPlayerEntity sp) {
+		World w = this.getWorld();
+		Vec3d eye = sp.getEyePos();
+		for (int i = 0; i < 60; i++) {
+			double ang = this.random.nextDouble() * Math.PI * 2;
+			double dist = 16.0 + this.random.nextDouble() * 14.0;
+			BlockPos base = BlockPos.ofFloored(sp.getX() + Math.cos(ang) * dist, sp.getY(), sp.getZ() + Math.sin(ang) * dist);
+			BlockPos spot = findStandSpot(base);
+			if (spot == null) continue;
+
+			Vec3d head = new Vec3d(spot.getX() + 0.5, spot.getY() + 1.6, spot.getZ() + 0.5);
+			boolean hidden = w.raycast(new RaycastContext(eye, head, RaycastContext.ShapeType.COLLIDER,
+					RaycastContext.FluidHandling.NONE, sp)).getType() == HitResult.Type.BLOCK;
+			if (!hidden) continue;
+
+			// Precisa ter algo sólido colado nele, do lado do jogador (o "esconderijo").
+			Vec3d toP = new Vec3d(sp.getX() - (spot.getX() + 0.5), 0, sp.getZ() - (spot.getZ() + 0.5)).normalize();
+			for (int k = 1; k <= 2; k++) {
+				BlockPos c = BlockPos.ofFloored(spot.getX() + 0.5 + toP.x * k, spot.getY() + 1, spot.getZ() + 0.5 + toP.z * k);
+				if (w.getBlockState(c).isSolidBlock(w, c)) return spot;
+			}
+		}
+		return null;
+	}
+
+	/** Dá um passo para o lado, saindo de trás do esconderijo para o jogador conseguir vê-lo. */
+	private void stepOutOfCover(ServerPlayerEntity sp) {
+		Vec3d toP = new Vec3d(sp.getX() - this.getX(), 0, sp.getZ() - this.getZ()).normalize();
+		Vec3d perp = new Vec3d(-toP.z, 0, toP.x);
+		World w = this.getWorld();
+		Vec3d eye = sp.getEyePos();
+		for (int side = -1; side <= 1; side += 2) {
+			BlockPos base = BlockPos.ofFloored(this.getX() + perp.x * side * 1.8, this.getY(), this.getZ() + perp.z * side * 1.8);
+			BlockPos spot = findStandSpot(base);
+			if (spot == null) continue;
+			Vec3d head = new Vec3d(spot.getX() + 0.5, spot.getY() + 1.6, spot.getZ() + 0.5);
+			boolean clear = w.raycast(new RaycastContext(eye, head, RaycastContext.ShapeType.COLLIDER,
+					RaycastContext.FluidHandling.NONE, sp)).getType() != HitResult.Type.BLOCK;
+			if (clear) {
+				this.refreshPositionAndAngles(spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5, this.getYaw(), 0.0f);
+				return;
+			}
 		}
 	}
 
@@ -451,6 +643,31 @@ public class WatcherEntity extends HostileEntity {
 		return 0.5f;
 	}
 
+	/** Durante a emboscada ele fica imóvel no esconderijo. */
+	static class AmbushHoldGoal extends Goal {
+		private final WatcherEntity mob;
+
+		AmbushHoldGoal(WatcherEntity mob) {
+			this.mob = mob;
+			this.setControls(EnumSet.of(Control.MOVE, Control.JUMP, Control.LOOK));
+		}
+
+		@Override
+		public boolean canStart() {
+			return this.mob.phase == 1;
+		}
+
+		@Override
+		public boolean shouldContinue() {
+			return this.mob.phase == 1;
+		}
+
+		@Override
+		public void start() {
+			this.mob.getNavigation().stop();
+		}
+	}
+
 	/** Trava movimento enquanto o Vigia é observado. */
 	static class FreezeWhenWatchedGoal extends Goal {
 		private final WatcherEntity mob;
@@ -462,7 +679,7 @@ public class WatcherEntity extends HostileEntity {
 
 		@Override
 		public boolean canStart() {
-			return this.mob.getTarget() != null && this.mob.isBeingWatched();
+			return this.mob.phase == 0 && this.mob.getTarget() != null && this.mob.isBeingWatched();
 		}
 
 		@Override
