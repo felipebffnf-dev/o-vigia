@@ -14,7 +14,6 @@ import net.minecraft.entity.ai.goal.Goal;
 import net.minecraft.entity.ai.goal.LookAroundGoal;
 import net.minecraft.entity.ai.goal.LookAtEntityGoal;
 import net.minecraft.entity.ai.goal.MeleeAttackGoal;
-import net.minecraft.entity.ai.goal.OpenDoorGoal;
 import net.minecraft.entity.ai.goal.RevengeGoal;
 import net.minecraft.entity.ai.goal.SwimGoal;
 import net.minecraft.entity.ai.goal.WanderAroundFarGoal;
@@ -129,8 +128,6 @@ public class WatcherEntity extends HostileEntity {
 		this.goalSelector.add(1, new SwimGoal(this));
 		this.goalSelector.add(2, new FreezeWhenWatchedGoal(this));
 		this.goalSelector.add(3, new MeleeAttackGoal(this, 1.3, true));
-		// Abre (e fecha) portas, como um jogador faria.
-		this.goalSelector.add(4, new OpenDoorGoal(this, true));
 		this.goalSelector.add(6, new WanderAroundFarGoal(this, 0.6));
 		this.goalSelector.add(7, new LookAtEntityGoal(this, PlayerEntity.class, 32.0f));
 		this.goalSelector.add(8, new LookAroundGoal(this));
