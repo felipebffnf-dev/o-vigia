@@ -7,12 +7,14 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import net.minecraft.entity.EntityType;
+import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.ai.goal.ActiveTargetGoal;
 import net.minecraft.entity.ai.goal.Goal;
 import net.minecraft.entity.ai.goal.LookAroundGoal;
 import net.minecraft.entity.ai.goal.LookAtEntityGoal;
 import net.minecraft.entity.ai.goal.MeleeAttackGoal;
+import net.minecraft.entity.ai.goal.OpenDoorGoal;
 import net.minecraft.entity.ai.goal.RevengeGoal;
 import net.minecraft.entity.ai.goal.SwimGoal;
 import net.minecraft.entity.ai.goal.WanderAroundFarGoal;
@@ -26,6 +28,7 @@ import net.minecraft.entity.effect.StatusEffectInstance;
 import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.entity.mob.HostileEntity;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.network.packet.s2c.play.PlaySoundS2CPacket;
 import net.minecraft.registry.entry.RegistryEntry;
@@ -35,6 +38,7 @@ import net.minecraft.sound.SoundEvent;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
+import net.minecraft.util.Hand;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
@@ -45,7 +49,7 @@ import net.minecraft.world.World;
  *  - fica PARADO enquanto alguém olha pra ele e avança quando você desvia o olhar;
  *  - persegue sem parar, e às vezes surge atrás de você (quando você não está olhando);
  *  - manda mensagens falsas no chat e toca sons atrás de você;
- *  - some ao amanhecer.
+ *  - aparece de dia e de noite.
  */
 public class WatcherEntity extends HostileEntity {
 
@@ -73,6 +77,10 @@ public class WatcherEntity extends HostileEntity {
 	private int replyTicks = 0;
 	private UUID replyPlayer = null;
 	private String replyText = "";
+
+	// Cópia dos movimentos do jogador
+	private boolean prevTargetOnGround = true;
+	private boolean prevTargetSwinging = false;
 
 	// Controle de "te vi"
 	private int sightCooldown = 0;
@@ -121,6 +129,8 @@ public class WatcherEntity extends HostileEntity {
 		this.goalSelector.add(1, new SwimGoal(this));
 		this.goalSelector.add(2, new FreezeWhenWatchedGoal(this));
 		this.goalSelector.add(3, new MeleeAttackGoal(this, 1.3, true));
+		// Abre (e fecha) portas, como um jogador faria.
+		this.goalSelector.add(4, new OpenDoorGoal(this, true));
 		this.goalSelector.add(6, new WanderAroundFarGoal(this, 0.6));
 		this.goalSelector.add(7, new LookAtEntityGoal(this, PlayerEntity.class, 32.0f));
 		this.goalSelector.add(8, new LookAroundGoal(this));
@@ -136,6 +146,9 @@ public class WatcherEntity extends HostileEntity {
 		if (target instanceof PlayerEntity player && old != target && !this.getWorld().isClient) {
 			// Ao escolher a vítima, assume a skin dela.
 			this.dataTracker.set(MIMIC, Optional.of(player.getUuid()));
+			// Até o nome igual ao do jogador.
+			this.setCustomName(Text.literal(player.getEntityName()));
+			this.setCustomNameVisible(true);
 			if (player instanceof ServerPlayerEntity sp) {
 				sp.sendMessage(Text.translatable("commands.message.display.incoming",
 						Text.literal("Vigia"), Text.literal("achei você, " + sp.getEntityName() + ".")
@@ -149,6 +162,15 @@ public class WatcherEntity extends HostileEntity {
 	public void tick() {
 		super.tick();
 		if (this.getWorld().isClient) return;
+
+		// Age como um jogador: copia agachar, correr, pular, bater e o equipamento do alvo.
+		LivingEntity mimicTarget = this.getTarget();
+		if (mimicTarget instanceof PlayerEntity tp) {
+			mimicPlayer(tp);
+		} else if (this.isSneaking() || this.isSprinting()) {
+			this.setSneaking(false);
+			this.setSprinting(false);
+		}
 
 		// Te viu? Faz um som assustador (só pra você) e avisa na tela.
 		if (this.sightCooldown > 0) this.sightCooldown--;
@@ -191,9 +213,45 @@ public class WatcherEntity extends HostileEntity {
 			tryAppearBehind(target);
 		}
 
-		// Some ao amanhecer.
-		if (this.age > 200 && this.getWorld().isDay()) {
-			this.discard();
+	}
+
+	// ---------- Copiar o jogador ----------
+
+	private void mimicPlayer(PlayerEntity tp) {
+		// Agacha quando o jogador agacha; corre quando ele corre (ou quando está longe).
+		this.setSneaking(tp.isSneaking());
+		boolean chasingFar = this.distanceTo(tp) > 6.0f && !tp.isSneaking();
+		this.setSprinting(tp.isSprinting() || chasingFar);
+
+		// Pula quando o jogador pula.
+		if (this.prevTargetOnGround && !tp.isOnGround() && this.isOnGround() && tp.fallDistance < 0.5f) {
+			this.jump();
+		}
+		this.prevTargetOnGround = tp.isOnGround();
+
+		// Balança o braço quando o jogador bate ou minera.
+		boolean swinging = tp.handSwinging;
+		if (swinging && !this.prevTargetSwinging) {
+			this.swingHand(Hand.MAIN_HAND);
+		}
+		this.prevTargetSwinging = swinging;
+
+		// Veste e segura o mesmo que o jogador.
+		if (this.age % 20 == 0) {
+			copyEquipment(tp);
+		}
+	}
+
+	private void copyEquipment(PlayerEntity tp) {
+		for (EquipmentSlot slot : EquipmentSlot.values()) {
+			ItemStack src = tp.getEquippedStack(slot);
+			ItemStack cur = this.getEquippedStack(slot);
+			if (!ItemStack.areEqual(src, cur)) {
+				ItemStack copy = src.copy();
+				if (!copy.isEmpty()) copy.setCount(1);
+				this.equipStack(slot, copy);
+			}
+			this.setEquipmentDropChance(slot, 0.0f); // não dropa o equipamento
 		}
 	}
 
